@@ -7,153 +7,330 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Configure via environment variables. Example: PGUSER=postgres, PGDATABASE=gioco_societa
+// Configurazione PostgreSQL tramite variabili d'ambiente
 const pool = new Pool({
   user: process.env.PGUSER || 'postgres',
   host: process.env.PGHOST || 'localhost',
   database: process.env.PGDATABASE || 'gioco_societa',
   password: process.env.PGPASSWORD || '',
   port: Number(process.env.PGPORT || 5432),
+  ssl: process.env.PGHOST && process.env.PGHOST !== 'localhost'
+    ? { rejectUnauthorized: false }
+    : false,
 });
 
 const GROUPS = ['A', 'B', 'C', 'D', 'E'];
 const BET = 5.00;
-const roundTenth = (val) => Math.round((Number(val) + Number.EPSILON) * 10) / 10;
+
+const roundTenth = (val) =>
+  Math.round((Number(val) + Number.EPSILON) * 10) / 10;
+
 const toTenths = (val) => Math.round(Number(val) * 10);
 
-
 function getLosingGroup(round) {
-  const index = (GROUPS.length - (Number(round) % GROUPS.length)) % GROUPS.length;
+  const index =
+    (GROUPS.length - (Number(round) % GROUPS.length)) %
+    GROUPS.length;
   return GROUPS[index];
 }
 
-
-// Randomly adjusts array entries by 0.10 steps until the requested total is reached.
-// The bounds are checked per entry; false means the target cannot be reached.
+// Modifica i valori di 0,10 fino a raggiungere il totale richiesto
 function adjustToTarget(values, targetTenths, minTenths, maxTenths) {
   let current = values.reduce((sum, v) => sum + toTenths(v), 0);
   let remaining = targetTenths - current;
   let guard = 0;
+
   while (remaining !== 0 && guard < 100000) {
     const increase = remaining > 0;
     const candidates = [];
+
     for (let i = 0; i < values.length; i++) {
       const v = toTenths(values[i]);
-      if (increase ? v < maxTenths : v > minTenths) candidates.push(i);
+
+      if (increase ? v < maxTenths : v > minTenths) {
+        candidates.push(i);
+      }
     }
+
     if (!candidates.length) return false;
+
     const idx = candidates[Math.floor(Math.random() * candidates.length)];
-    values[idx] = (toTenths(values[idx]) + (increase ? 1 : -1)) / 10;
+
+    values[idx] =
+      (toTenths(values[idx]) + (increase ? 1 : -1)) / 10;
+
     remaining += increase ? -1 : 1;
     guard++;
   }
+
   return remaining === 0;
 }
 
-
-async function generateRoundInDB(client, sessionId, roundNumber, reserveFund, initialAdvance) {
+// Genera e salva i 100 coperti della mano
+async function generateRoundInDB(
+  client,
+  sessionId,
+  roundNumber,
+  reserveFund,
+  initialAdvance
+) {
   const losingGroup = getLosingGroup(roundNumber);
+
   let recoveryTarget = 0;
-  if (roundNumber >= 6 && roundNumber <= 12 && reserveFund < initialAdvance) {
+
+  if (
+    roundNumber >= 6 &&
+    roundNumber <= 12 &&
+    reserveFund < initialAdvance
+  ) {
     const remainingRounds = 13 - roundNumber;
-    recoveryTarget = roundTenth((initialAdvance - reserveFund) / remainingRounds);
+    recoveryTarget = roundTenth(
+      (initialAdvance - reserveFund) / remainingRounds
+    );
   }
 
-  const totalCollected = 100 * BET; // 500.00
-  // With payout ranges below, total payout must be at least 20*3.20 + 80*5.10 = 472.
+  const totalCollected = 100 * BET;
+
   const minPayout = 20 * 3.20 + 80 * 5.10;
   const maxPayout = 20 * 4.80 + 80 * 5.90;
-  const desiredPayout = totalCollected - recoveryTarget;
-  const targetPayout = roundTenth(Math.min(maxPayout, Math.max(minPayout, desiredPayout)));
 
-  // 20 losing seats: range 3.20–4.80; start randomized within 3.80–4.80.
-  const losers = Array.from({ length: 20 }, () => roundTenth(3.80 + Math.floor(Math.random() * 11) * 0.10));
-  // 80 winning seats: start at 5.10, then adjust the combined total to the target.
+  const desiredPayout = totalCollected - recoveryTarget;
+
+  const targetPayout = roundTenth(
+    Math.min(maxPayout, Math.max(minPayout, desiredPayout))
+  );
+
+  // 20 perdenti: valori tra 3,20 e 4,80
+  const losers = Array.from({ length: 20 }, () =>
+    roundTenth(
+      3.80 + Math.floor(Math.random() * 11) * 0.10
+    )
+  );
+
+  // 80 vincenti: base 5,10
   const winners = new Array(80).fill(5.10);
-  const baseTotalTenths = losers.reduce((sum, v) => sum + toTenths(v), 0)
-    + winners.reduce((sum, v) => sum + toTenths(v), 0);
+
+  const baseTotalTenths =
+    losers.reduce((sum, v) => sum + toTenths(v), 0) +
+    winners.reduce((sum, v) => sum + toTenths(v), 0);
+
   const targetTenths = toTenths(targetPayout);
 
-  // First adjust the winning pool up to its cap; if the target is below baseline,
-  // lower losing seats first, then winning seats if necessary. All amounts remain in 0.10 steps.
-  const winnerSumTenths = () => winners.reduce((sum, v) => sum + toTenths(v), 0);
-  const loserSumTenths = () => losers.reduce((sum, v) => sum + toTenths(v), 0);
+  const winnerSumTenths = () =>
+    winners.reduce((sum, v) => sum + toTenths(v), 0);
+
+  const loserSumTenths = () =>
+    losers.reduce((sum, v) => sum + toTenths(v), 0);
+
   if (targetTenths >= baseTotalTenths) {
-    const desiredWinnerTotal = Math.min(80 * 59, Math.max(80 * 51, targetTenths - loserSumTenths()));
+    const desiredWinnerTotal = Math.min(
+      80 * 59,
+      Math.max(80 * 51, targetTenths - loserSumTenths())
+    );
+
     if (!adjustToTarget(winners, desiredWinnerTotal, 51, 59)) {
-      throw new Error('Impossibile distribuire il totale vincite richiesto entro i limiti configurati.');
+      throw new Error(
+        'Impossibile distribuire le vincite entro i limiti configurati.'
+      );
     }
-    const desiredLoserTotal = targetTenths - winnerSumTenths();
+
+    const desiredLoserTotal =
+      targetTenths - winnerSumTenths();
+
     if (!adjustToTarget(losers, desiredLoserTotal, 32, 48)) {
-      throw new Error('Impossibile distribuire il totale vincite richiesto entro i limiti configurati.');
+      throw new Error(
+        'Impossibile distribuire le vincite entro i limiti configurati.'
+      );
     }
   } else {
-    const desiredLoserTotal = Math.min(20 * 48, Math.max(20 * 32, targetTenths - winnerSumTenths()));
+    const desiredLoserTotal = Math.min(
+      20 * 48,
+      Math.max(20 * 32, targetTenths - winnerSumTenths())
+    );
+
     if (!adjustToTarget(losers, desiredLoserTotal, 32, 48)) {
-      throw new Error('Impossibile distribuire il totale vincite richiesto entro i limiti configurati.');
+      throw new Error(
+        'Impossibile distribuire le vincite entro i limiti configurati.'
+      );
     }
-    const desiredWinnerTotal = targetTenths - loserSumTenths();
+
+    const desiredWinnerTotal =
+      targetTenths - loserSumTenths();
+
     if (!adjustToTarget(winners, desiredWinnerTotal, 51, 59)) {
-      throw new Error('Impossibile distribuire il totale vincite richiesto entro i limiti configurati.');
+      throw new Error(
+        'Impossibile distribuire le vincite entro i limiti configurati.'
+      );
     }
   }
 
-
-  // Shuffle each payout pool to avoid a fixed ordering pattern in the seats.
+  // Mischia gli importi per non avere schemi fissi sui posti
   winners.sort(() => Math.random() - 0.5);
   losers.sort(() => Math.random() - 0.5);
 
-
   let wIdx = 0;
   let lIdx = 0;
+
+  // Inserisce i 100 posti nel database
   for (let i = 0; i < 100; i++) {
     const seatNum = i + 1;
     const group = GROUPS[Math.floor(i / 20)];
-    const amount = group === losingGroup ? losers[lIdx++] : winners[wIdx++];
+
+    const amount =
+      group === losingGroup
+        ? losers[lIdx++]
+        : winners[wIdx++];
+
     await client.query(
-      `INSERT INTO giocate_coperti (sessione_id, numero_mano, numero_posto, gruppo, puntata, vincita_assegnata)
+      `INSERT INTO giocate_coperti
+       (sessione_id, numero_mano, numero_posto, gruppo, puntata, vincita_assegnata)
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [sessionId, roundNumber, seatNum, group, BET, amount]
     );
   }
 
-  const actualPaid = roundTenth(losers.reduce((a, b) => a + b, 0) + winners.reduce((a, b) => a + b, 0));
+  // Calcolo del recupero effettivo
+  const actualPaid = roundTenth(
+    losers.reduce((a, b) => a + b, 0) +
+    winners.reduce((a, b) => a + b, 0)
+  );
+
   const recoveredNow = roundTenth(totalCollected - actualPaid);
+
   if (recoveredNow > 0) {
     const newReserve = roundTenth(reserveFund + recoveredNow);
+
     await client.query(
-      `UPDATE sessioni_gioco SET cassa_compensazione = $1 WHERE id = $2`,
+      `UPDATE sessioni_gioco
+       SET cassa_compensazione = $1
+       WHERE id = $2`,
       [newReserve, sessionId]
     );
+
     await client.query(
-      `INSERT INTO movimenti_cassa (sessione_id, numero_mano, tipo_movimento, importo, saldo_cassa_dopo, note)
-       VALUES ($1, $2, 'recupero_amm', $3, $4, 'Recupero automatico quota gestore')`,
+      `INSERT INTO movimenti_cassa
+       (sessione_id, numero_mano, tipo_movimento,
+        importo, saldo_cassa_dopo, note)
+       VALUES ($1, $2, 'recupero_amm', $3, $4,
+       'Recupero automatico quota gestore')`,
       [sessionId, roundNumber, recoveredNow, newReserve]
     );
   }
 }
 
+// ============================================================
+// INIZIALIZZAZIONE AUTOMATICA DATABASE
+// ============================================================
+async function initDatabase() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS utenti (
+        id BIGSERIAL PRIMARY KEY,
+        nome VARCHAR(120) NOT NULL,
+        saldo_gettoni NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (saldo_gettoni >= 0),
+        creato_il TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS sessioni_gioco (
+        id BIGSERIAL PRIMARY KEY,
+        nome_tavolo VARCHAR(120) NOT NULL DEFAULT 'VINCI (QUASI) SEMPRE',
+        mano_corrente INTEGER NOT NULL DEFAULT 1 CHECK (mano_corrente >= 1),
+        stato VARCHAR(30) NOT NULL DEFAULT 'attiva',
+        cassa_compensazione NUMERIC(12,2) NOT NULL DEFAULT 40.00,
+        anticipo_gestore_iniziale NUMERIC(12,2) NOT NULL DEFAULT 40.00,
+        creata_il TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS giocate_coperti (
+        id BIGSERIAL PRIMARY KEY,
+        sessione_id BIGINT NOT NULL REFERENCES sessioni_gioco(id) ON DELETE CASCADE,
+        numero_mano INTEGER NOT NULL,
+        numero_posto INTEGER NOT NULL CHECK (numero_posto BETWEEN 1 AND 100),
+        gruppo CHAR(1) NOT NULL CHECK (gruppo IN ('A','B','C','D','E')),
+        puntata NUMERIC(12,2) NOT NULL DEFAULT 5.00,
+        vincita_assegnata NUMERIC(12,2) NOT NULL,
+        utente_id BIGINT REFERENCES utenti(id),
+        scoperto BOOLEAN NOT NULL DEFAULT FALSE,
+        scoperto_il TIMESTAMPTZ,
+        UNIQUE (sessione_id, numero_mano, numero_posto)
+      );
+      CREATE TABLE IF NOT EXISTS movimenti_cassa (
+        id BIGSERIAL PRIMARY KEY,
+        sessione_id BIGINT NOT NULL REFERENCES sessioni_gioco(id) ON DELETE CASCADE,
+        numero_mano INTEGER NOT NULL,
+        tipo_movimento VARCHAR(40) NOT NULL,
+        importo NUMERIC(12,2) NOT NULL,
+        saldo_cassa_dopo NUMERIC(12,2) NOT NULL,
+        note TEXT,
+        creato_il TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS transazioni_gettoni (
+        id BIGSERIAL PRIMARY KEY,
+        utente_id BIGINT NOT NULL REFERENCES utenti(id),
+        sessione_id BIGINT NOT NULL REFERENCES sessioni_gioco(id),
+        tipo VARCHAR(40) NOT NULL,
+        importo NUMERIC(12,2) NOT NULL,
+        saldo_risultante NUMERIC(12,2) NOT NULL,
+        creato_il TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      INSERT INTO sessioni_gioco (id, nome_tavolo, mano_corrente, stato, cassa_compensazione, anticipo_gestore_iniziale)
+      VALUES (1, 'VINCI (QUASI) SEMPRE', 1, 'attiva', 40.00, 40.00)
+      ON CONFLICT (id) DO NOTHING;
+      INSERT INTO utenti (id, nome, saldo_gettoni)
+      VALUES (1, 'Giocatore 1', 500.00)
+      ON CONFLICT (id) DO NOTHING;
+    `);
 
-// ============================================================================
+    const checkSeats = await client.query(
+      `SELECT COUNT(*) FROM giocate_coperti WHERE sessione_id = 1 AND numero_mano = 1`
+    );
+    if (Number(checkSeats.rows[0].count) === 0) {
+      await client.query('BEGIN');
+      await generateRoundInDB(client, 1, 1, 40.00, 40.00);
+      await client.query('COMMIT');
+    }
+    console.log('Database e tavolo iniziale pronti!');
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error('Errore initDatabase:', err);
+  } finally {
+    client.release();
+  }
+}
+
+// ============================================================
 // API PUBBLICHE (GIOCATORI)
-// ============================================================================
+// ============================================================
+
+// Legge lo stato del tavolo
 app.get('/api/tavolo/:sessioneId', async (req, res) => {
   try {
     const { sessioneId } = req.params;
+
     const sessRes = await pool.query(
-      `SELECT id, nome_tavolo, mano_corrente, stato FROM sessioni_gioco WHERE id = $1`,
+      `SELECT id, nome_tavolo, mano_corrente, stato
+       FROM sessioni_gioco
+       WHERE id = $1`,
       [sessioneId]
     );
-    if (sessRes.rows.length === 0) return res.status(404).json({ error: 'Sessione non trovata' });
+
+    if (sessRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Sessione non trovata' });
+    }
+
     const sessione = sessRes.rows[0];
+
     const seatsRes = await pool.query(
       `SELECT numero_posto, gruppo, scoperto,
-              CASE WHEN scoperto = TRUE THEN vincita_assegnata ELSE NULL END AS vincita
+              CASE
+                WHEN scoperto = TRUE THEN vincita_assegnata
+                ELSE NULL
+              END AS vincita
        FROM giocate_coperti
        WHERE sessione_id = $1 AND numero_mano = $2
        ORDER BY numero_posto ASC`,
       [sessioneId, sessione.mano_corrente]
     );
+
     res.json({ sessione, posti: seatsRes.rows });
   } catch (err) {
     console.error('Errore GET /api/tavolo:', err);
@@ -161,66 +338,146 @@ app.get('/api/tavolo/:sessioneId', async (req, res) => {
   }
 });
 
-
+// Giocata su un coperchio
 app.post('/api/gioca', async (req, res) => {
   const { sessioneId, numeroPosto, utenteId } = req.body || {};
-  if (!sessioneId || !utenteId || !Number.isInteger(Number(numeroPosto)) || Number(numeroPosto) < 1 || Number(numeroPosto) > 100) {
-    return res.status(400).json({ error: 'Parametri di giocata non validi' });
+
+  if (
+    !sessioneId ||
+    !utenteId ||
+    !Number.isInteger(Number(numeroPosto)) ||
+    Number(numeroPosto) < 1 ||
+    Number(numeroPosto) > 100
+  ) {
+    return res.status(400).json({
+      error: 'Parametri di giocata non validi'
+    });
   }
+
   const client = await pool.connect();
   let transactionStarted = false;
+
   try {
     await client.query('BEGIN');
     transactionStarted = true;
-    const sessRes = await client.query(`SELECT mano_corrente FROM sessioni_gioco WHERE id = $1 FOR UPDATE`, [sessioneId]);
+
+    const sessRes = await client.query(
+      `SELECT mano_corrente
+       FROM sessioni_gioco
+       WHERE id = $1
+       FOR UPDATE`,
+      [sessioneId]
+    );
+
     if (!sessRes.rows.length) {
       await client.query('ROLLBACK');
+      transactionStarted = false;
       return res.status(404).json({ error: 'Sessione non trovata' });
     }
+
     const mano = sessRes.rows[0].mano_corrente;
+
     const seatRes = await client.query(
-      `SELECT id, vincita_assegnata, scoperto FROM giocate_coperti
-       WHERE sessione_id = $1 AND numero_mano = $2 AND numero_posto = $3 FOR UPDATE`,
+      `SELECT id, vincita_assegnata, scoperto
+       FROM giocate_coperti
+       WHERE sessione_id = $1
+         AND numero_mano = $2
+         AND numero_posto = $3
+       FOR UPDATE`,
       [sessioneId, mano, Number(numeroPosto)]
     );
+
     const posto = seatRes.rows[0];
+
     if (!posto || posto.scoperto) {
       await client.query('ROLLBACK');
       transactionStarted = false;
-      return res.status(400).json({ error: 'Coperchio già aperto o non valido' });
+      return res.status(400).json({
+        error: 'Coperchio già aperto o non valido'
+      });
     }
-    const userRes = await client.query(`SELECT saldo_gettoni FROM utenti WHERE id = $1 FOR UPDATE`, [utenteId]);
+
+    const userRes = await client.query(
+      `SELECT saldo_gettoni
+       FROM utenti
+       WHERE id = $1
+       FOR UPDATE`,
+      [utenteId]
+    );
+
     if (!userRes.rows.length) {
       await client.query('ROLLBACK');
       transactionStarted = false;
       return res.status(404).json({ error: 'Utente non trovato' });
     }
+
     const saldoAttuale = Number(userRes.rows[0].saldo_gettoni);
+
     if (!Number.isFinite(saldoAttuale) || saldoAttuale < BET) {
       await client.query('ROLLBACK');
       transactionStarted = false;
-      return res.status(400).json({ error: 'Gettoni insufficienti (servono 5 gettoni)' });
+      return res.status(400).json({
+        error: 'Gettoni insufficienti (servono 5 gettoni)'
+      });
     }
+
     const vincita = Number(posto.vincita_assegnata);
-    if (!Number.isFinite(vincita)) throw new Error('Importo vincita non valido nel database');
+
+    if (!Number.isFinite(vincita)) {
+      throw new Error('Importo vincita non valido nel database');
+    }
+
     const nuovoSaldo = roundTenth(saldoAttuale - BET + vincita);
-    await client.query(`UPDATE utenti SET saldo_gettoni = $1 WHERE id = $2`, [nuovoSaldo, utenteId]);
+
+    // Aggiorna saldo utente e apre il coperchio
     await client.query(
-      `UPDATE giocate_coperti SET utente_id = $1, scoperto = TRUE, scoperto_il = NOW() WHERE id = $2`,
+      `UPDATE utenti
+       SET saldo_gettoni = $1
+       WHERE id = $2`,
+      [nuovoSaldo, utenteId]
+    );
+
+    await client.query(
+      `UPDATE giocate_coperti
+       SET utente_id = $1, scoperto = TRUE, scoperto_il = NOW()
+       WHERE id = $2`,
       [utenteId, posto.id]
     );
+
+    // Storico transazioni
     await client.query(
-      `INSERT INTO transazioni_gettoni (utente_id, sessione_id, tipo, importo, saldo_risultante)
-       VALUES ($1, $2, 'puntata', -5.00, $3), ($1, $2, 'vincita', $4, $5)`,
-      [utenteId, sessioneId, roundTenth(saldoAttuale - BET), vincita, nuovoSaldo]
+      `INSERT INTO transazioni_gettoni
+       (utente_id, sessione_id, tipo, importo, saldo_risultante)
+       VALUES
+       ($1, $2, 'puntata', -5.00, $3),
+       ($1, $2, 'vincita', $4, $5)`,
+      [
+        utenteId,
+        sessioneId,
+        roundTenth(saldoAttuale - BET),
+        vincita,
+        nuovoSaldo
+      ]
     );
+
     await client.query('COMMIT');
     transactionStarted = false;
-    res.json({ success: true, numeroPosto: Number(numeroPosto), vincita, nuovoSaldo });
+
+    res.json({
+      success: true,
+      numeroPosto: Number(numeroPosto),
+      vincita,
+      nuovoSaldo
+    });
   } catch (err) {
     if (transactionStarted) {
-      try { await client.query('ROLLBACK'); } catch (rollbackErr) { console.error('Errore rollback:', rollbackErr); }
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        console.error('Errore rollback:', rollbackErr);
+      }
     }
+
     console.error('Errore POST /api/gioca:', err);
     res.status(500).json({ error: 'Errore durante la giocata' });
   } finally {
@@ -228,24 +485,38 @@ app.post('/api/gioca', async (req, res) => {
   }
 });
 
-
-// ============================================================================
+// ============================================================
 // API RISERVATE AL GESTORE
-// ============================================================================
+// ============================================================
+
 const ADMIN_KEY = process.env.ADMIN_KEY;
+
 function checkAdmin(req, res, next) {
   if (!ADMIN_KEY || req.headers['x-admin-key'] !== ADMIN_KEY) {
-    return res.status(403).json({ error: 'Accesso riservato al gestore' });
+    return res.status(403).json({
+      error: 'Accesso riservato al gestore'
+    });
   }
+
   next();
 }
 
-
+// Stato privato cassa
 app.get('/api/admin/stato/:sessioneId', checkAdmin, async (req, res) => {
   try {
-    const sess = await pool.query(`SELECT * FROM sessioni_gioco WHERE id = $1`, [req.params.sessioneId]);
-    if (!sess.rows.length) return res.status(404).json({ error: 'Sessione non trovata' });
+    const sess = await pool.query(
+      `SELECT *
+       FROM sessioni_gioco
+       WHERE id = $1`,
+      [req.params.sessioneId]
+    );
+
+    if (!sess.rows.length) {
+      return res.status(404).json({ error: 'Sessione non trovata' });
+    }
+
     const s = sess.rows[0];
+
     res.json({
       mano_corrente: s.mano_corrente,
       cassa_compensazione: s.cassa_compensazione,
@@ -258,99 +529,181 @@ app.get('/api/admin/stato/:sessioneId', checkAdmin, async (req, res) => {
   }
 });
 
-
+// Rivela tutti i risultati del tavolo
 app.post('/api/admin/rivela-tutti/:sessioneId', checkAdmin, async (req, res) => {
   try {
     const { sessioneId } = req.params;
-    const sess = await pool.query(`SELECT mano_corrente FROM sessioni_gioco WHERE id = $1`, [sessioneId]);
-    if (!sess.rows.length) return res.status(404).json({ error: 'Sessione non trovata' });
+
+    const sess = await pool.query(
+      `SELECT mano_corrente
+       FROM sessioni_gioco
+       WHERE id = $1`,
+      [sessioneId]
+    );
+
+    if (!sess.rows.length) {
+      return res.status(404).json({ error: 'Sessione non trovata' });
+    }
+
     await pool.query(
-      `UPDATE giocate_coperti SET scoperto = TRUE, scoperto_il = NOW()
+      `UPDATE giocate_coperti
+       SET scoperto = TRUE, scoperto_il = NOW()
        WHERE sessione_id = $1 AND numero_mano = $2`,
       [sessioneId, sess.rows[0].mano_corrente]
     );
-    res.json({ success: true, message: 'Tutti i coperchi rivelati' });
+
+    res.json({
+      success: true,
+      message: 'Tutti i coperchi rivelati'
+    });
   } catch (err) {
     console.error('Errore admin/rivela-tutti:', err);
     res.status(500).json({ error: 'Errore interno del server' });
   }
 });
 
-
+// Passa alla giocata successiva
 app.post('/api/admin/prossima-mano/:sessioneId', checkAdmin, async (req, res) => {
   const { sessioneId } = req.params;
   const client = await pool.connect();
   let transactionStarted = false;
+
   try {
     await client.query('BEGIN');
     transactionStarted = true;
-    const sess = await client.query(`SELECT * FROM sessioni_gioco WHERE id = $1 FOR UPDATE`, [sessioneId]);
+
+    const sess = await client.query(
+      `SELECT *
+       FROM sessioni_gioco
+       WHERE id = $1
+       FOR UPDATE`,
+      [sessioneId]
+    );
+
     if (!sess.rows.length) {
       await client.query('ROLLBACK');
       transactionStarted = false;
       return res.status(404).json({ error: 'Sessione non trovata' });
     }
+
     const s = sess.rows[0];
     const nextRound = Number(s.mano_corrente) + 1;
-    await client.query(`UPDATE sessioni_gioco SET mano_corrente = $1 WHERE id = $2`, [nextRound, sessioneId]);
-    await generateRoundInDB(client, sessioneId, nextRound, Number(s.cassa_compensazione), Number(s.anticipo_gestore_iniziale));
+
+    await client.query(
+      `UPDATE sessioni_gioco
+       SET mano_corrente = $1
+       WHERE id = $2`,
+      [nextRound, sessioneId]
+    );
+
+    await generateRoundInDB(
+      client,
+      sessioneId,
+      nextRound,
+      Number(s.cassa_compensazione),
+      Number(s.anticipo_gestore_iniziale)
+    );
+
     await client.query('COMMIT');
     transactionStarted = false;
+
     res.json({ success: true, nuovaMano: nextRound });
   } catch (err) {
     if (transactionStarted) {
-      try { await client.query('ROLLBACK'); } catch (rollbackErr) { console.error('Errore rollback:', rollbackErr); }
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        console.error('Errore rollback:', rollbackErr);
+      }
     }
+
     console.error('Errore admin/prossima-mano:', err);
-    res.status(500).json({ error: 'Errore durante la creazione della mano' });
+    res.status(500).json({
+      error: 'Errore durante la creazione della mano'
+    });
   } finally {
     client.release();
   }
 });
 
-
+// Ricomincia sessione
 app.post('/api/admin/ricomincia/:sessioneId', checkAdmin, async (req, res) => {
   const { sessioneId } = req.params;
   const client = await pool.connect();
   let transactionStarted = false;
+
   try {
     await client.query('BEGIN');
     transactionStarted = true;
-    const sess = await client.query(`SELECT id FROM sessioni_gioco WHERE id = $1 FOR UPDATE`, [sessioneId]);
+
+    const sess = await client.query(
+      `SELECT id
+       FROM sessioni_gioco
+       WHERE id = $1
+       FOR UPDATE`,
+      [sessioneId]
+    );
+
     if (!sess.rows.length) {
       await client.query('ROLLBACK');
       transactionStarted = false;
       return res.status(404).json({ error: 'Sessione non trovata' });
     }
-    await client.query(`DELETE FROM giocate_coperti WHERE sessione_id = $1`, [sessioneId]);
+
+    await client.query(
+      `DELETE FROM giocate_coperti
+       WHERE sessione_id = $1`,
+      [sessioneId]
+    );
+
     await client.query(
       `UPDATE sessioni_gioco
-       SET mano_corrente = 1, cassa_compensazione = 40.00, anticipo_gestore_iniziale = 40.00
+       SET mano_corrente = 1,
+           cassa_compensazione = 40.00,
+           anticipo_gestore_iniziale = 40.00
        WHERE id = $1`,
       [sessioneId]
     );
+
     await client.query(
       `INSERT INTO movimenti_cassa
-       (sessione_id, numero_mano, tipo_movimento, importo, saldo_cassa_dopo, note)
-       VALUES ($1, 1, 'anticipo_gestore', 40.00, 40.00, 'Nuova sessione avviata dal gestore')`,
+       (sessione_id, numero_mano, tipo_movimento,
+        importo, saldo_cassa_dopo, note)
+       VALUES
+       ($1, 1, 'anticipo_gestore', 40.00, 40.00,
+        'Nuova sessione avviata dal gestore')`,
       [sessioneId]
     );
+
     await generateRoundInDB(client, sessioneId, 1, 40.00, 40.00);
+
     await client.query('COMMIT');
     transactionStarted = false;
+
     res.json({ success: true, message: 'Sessione riavviata' });
   } catch (err) {
     if (transactionStarted) {
-      try { await client.query('ROLLBACK'); } catch (rollbackErr) { console.error('Errore rollback:', rollbackErr); }
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        console.error('Errore rollback:', rollbackErr);
+      }
     }
+
     console.error('Errore admin/ricomincia:', err);
-    res.status(500).json({ error: 'Errore durante il riavvio della sessione' });
+    res.status(500).json({
+      error: 'Errore durante il riavvio della sessione'
+    });
   } finally {
     client.release();
   }
 });
 
-
-app.listen(Number(process.env.PORT || 3000), () => {
-  console.log(`🚀 Server VINCI in ascolto su http://localhost:${process.env.PORT || 3000}`);
+// Avvio server dopo aver inizializzato il DB
+initDatabase().then(() => {
+  app.listen(Number(process.env.PORT || 3000), () => {
+    console.log(
+      `Server VINCI in ascolto su http://localhost:${process.env.PORT || 3000}`
+    );
+  });
 });
